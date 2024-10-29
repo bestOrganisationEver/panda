@@ -699,26 +699,57 @@ GArray *qemu_plugin_get_registers(void)
     return create_register_handles(regs);
 }
 
-bool qemu_plugin_read_memory_vaddr(vaddr addr, GByteArray *data, size_t len)
-{
-    g_assert(current_cpu);
 
-    if (len == 0) {
-        return false;
-    }
+bool qemu_plugin_read_memory_vaddr(vaddr addr, GByteArray *data, size_t len) {
+  g_assert(current_cpu);
 
-    g_byte_array_set_size(data, len);
+  if (len == 0) {
+    return false;
+  }
 
-    int result = cpu_memory_rw_debug(current_cpu, addr, data->data,
-                                     data->len, false);
+  g_byte_array_set_size(data, len);
 
-    if (result < 0) {
-        return false;
-    }
+  int result =
+      cpu_memory_rw_debug(current_cpu, addr, data->data, data->len, false);
 
-    return true;
+  if (result < 0) {
+    return false;
+  }
+
+  return true;
 }
 
+bool qemu_plugin_write_memory_vaddr(vaddr addr, GByteArray *data, size_t len) {
+  g_assert(current_cpu);
+
+  if (len == 0) {
+    return false;
+  }
+
+  g_byte_array_set_size(data, len);
+
+  int result =
+      cpu_memory_rw_debug(current_cpu, addr, data->data, data->len, true);
+
+  if (result < 0) {
+    return false;
+  }
+
+  return true;
+}
+
+bool qemu_plugin_write_reg(int reg_idx, uint8_t *val, /* uint64_t we_mask,*/
+                           char *register_name) {
+  g_assert(current_cpu);
+
+  int result = gdb_write_register(current_cpu, val, reg_idx);
+
+  if (result < 0) {
+    return false;
+  }
+  return true;
+  //   register_write(reg, val, we_mask, register_name, true);
+}
 
 uint64_t qemu_plugin_virt_to_phys(uint64_t addr) {
 #ifdef CONFIG_USER_ONLY

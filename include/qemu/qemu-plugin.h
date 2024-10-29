@@ -1004,8 +1004,12 @@ GArray *qemu_plugin_get_registers(void);
  * Returns true on success and false on failure.
  */
 QEMU_PLUGIN_API
-bool qemu_plugin_read_memory_vaddr(uint64_t addr,
-                                          GByteArray *data, size_t len);
+bool qemu_plugin_read_memory_vaddr(uint64_t addr, GByteArray *data, size_t len);
+QEMU_PLUGIN_API
+bool qemu_plugin_write_memory_vaddr(uint64_t addr, GByteArray *data,
+                                    size_t len);
+QEMU_PLUGIN_API
+bool qemu_plugin_write_reg(int reg_idx, uint8_t *val, char *register_name);
 
 /**
  * Translates guest virtual address to a guest physical address.
