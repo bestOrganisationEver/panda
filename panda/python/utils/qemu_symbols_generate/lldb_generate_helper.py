@@ -73,6 +73,7 @@ class DepType(enum.IntEnum):
     Typedef_structA_B = 6
     Typedef_structAptr_B = 7
     Typedef_enumA_B_or_Typedef_enumAptr_B = 8
+    Typedef_array_B = 9
     # # typedef A B;
     # TypedefDepInTypedef = 4
 
@@ -85,15 +86,17 @@ def get_sized_inner(lldbtype: lldb.SBType):
     extra information"""
 
     in_pointer = False
+    in_array = False
     while True:
         ttype = lldbtype.type
         if ttype == lldb.eTypeClassArray:
             lldbtype = lldbtype.GetArrayElementType()
+            in_array = True
         elif ttype == lldb.eTypeClassPointer:
             lldbtype = lldbtype.GetPointeeType()
             in_pointer = True
         else:
-            return lldbtype, in_pointer
+            return lldbtype, in_pointer, in_array
 
 
 def break_type_down(lldbtype: lldb.SBType):
@@ -110,7 +113,7 @@ def break_type_down(lldbtype: lldb.SBType):
     if ttype == lldb.eTypeClassTypedef:
         td_type: lldb.SBType
         in_pointer: bool
-        td_type, in_pointer = get_sized_inner(lldbtype.GetTypedefedType())
+        td_type, in_pointer, in_array = get_sized_inner(lldbtype.GetTypedefedType())
 
         # to_resolve.put(
         #     td_type,
@@ -151,6 +154,17 @@ def break_type_down(lldbtype: lldb.SBType):
                     raise Exception()
 
             return
+        elif in_array:
+            if td_type.type != lldb.eTypeClassBuiltin:
+                yield td_type, DepType.Typedef_array_B
+                chain_len, tdtype = resolve_typedefs(lldbtype)
+                assert chain_len != 0
+
+                if tdtype.type != lldb.eTypeClassPointer:
+                    for x in break_type_down_after_typedefs(tdtype):
+                        yield x
+            return
+
         else:
             if td_type.type == lldb.eTypeClassBuiltin:
                 return
@@ -172,7 +186,18 @@ def break_type_down(lldbtype: lldb.SBType):
             return
 
     # we've handled the immediate typedef.
-    elif ttype == lldb.eTypeClassStruct:
+    for i in break_type_down_after_typedefs(lldbtype):
+        yield i
+
+
+def break_type_down_after_typedefs(lldbtype: lldb.SBType):
+    assert type(lldbtype) == lldb.SBType
+    assert lldbtype.type != lldb.eTypeClassTypedef
+
+    to_resolve: TypeDepQueue = TypeDepQueue()
+    ttype = lldbtype.type
+
+    if ttype == lldb.eTypeClassStruct:
         for t in lldbtype.get_fields_array():
             to_resolve.put(t.GetType(), TypeDepState.NotInPointer)
     elif ttype == lldb.eTypeClassUnion:
@@ -310,7 +335,8 @@ def type_c_name_iw(lldbtype: lldb.SBType, iw: "IndentedWriter") -> None:
         iw.add_line("enum " + lldbtype.name)
 
     elif ttype == lldb.eTypeClassBuiltin:
-        iw.add_line(lldbtype.name)
+        # Not .name, because _Bool becomes bool. Sigh.
+        iw.add_line(lldbtype.__repr__())
     else:
         raise RuntimeError("wrong type", lldbtype, lldbtype.name, lldbtype.type)
 
@@ -414,7 +440,8 @@ def type_value_c_repr_iw(
             return
 
     elif ttype == lldb.eTypeClassBuiltin:
-        iw.add_line(lldbtype.name + " " + var_str)
+        # not .name, because _Bool becomes bool.
+        iw.add_line(lldbtype.__repr__() + " " + var_str)
     else:
         raise RuntimeError(ttype, lldbtype)
 
@@ -626,8 +653,18 @@ class TypeDepNode:
 class HardDepHeader:
     def __init__(self):
         self.nodes: list[lldb.SBType] = []
+        self.nodes_names: set[tuple[str, int]] = set()
         self.outstanding_soft_deps = []
         # self.soft_deps_that_need_decl: list[lldb.SBType] = []
+
+    def find_node(self, lldbtype: lldb.SBType):
+        if lldbtype.IsAnonymousType():
+            return -1
+
+        for i, node in enumerate(self.nodes):
+            if (node.name, node.type) == (lldbtype.name, lldbtype.type):
+                return i
+        return -1
 
     def add_typedef_type(self, lldbtype: lldb.SBType, need_complete: bool):
         print("add typedef type:", lldbtype, need_complete)
@@ -638,15 +675,24 @@ class HardDepHeader:
         for dep, dep_type in break_type_down(lldbtype):
             print("  add_typedef_type dep:", dep.name)
             if dep.IsTypedefType():
-                self.add_typedef_type(dep, need_complete=need_complete)
+                if dep_type == DepType.Typedef_array_B:
+                    print("ARRAY2:", lldbtype, dep)
+                    self.add_typedef_type(dep, need_complete=True)
+                else:
+                    self.add_typedef_type(dep, need_complete=need_complete)
+
             else:
-                if need_complete or dep.type == lldb.eTypeClassEnumeration:
+                if dep_type == DepType.Typedef_enumA_B_or_Typedef_enumAptr_B:
+                    self.add_type(dep)
+                elif dep_type == DepType.Typedef_array_B:
+                    print("ARRAY:", lldbtype, dep)
+                    self.add_type(dep)
+                elif need_complete:
                     if dep_type == DepType.Typedef_structA_B:
+                        # print("need_complete", )
                         self.add_type(dep)
                     elif dep_type == DepType.Typedef_structAptr_B:
                         self.add_soft_dep(dep)
-                    elif dep_type == DepType.Typedef_enumA_B_or_Typedef_enumAptr_B:
-                        self.add_type(dep)
                     else:
                         raise Exception(
                             lldbtype,
@@ -655,7 +701,14 @@ class HardDepHeader:
                             get_sized_inner(lldbtype.GetTypedefedType()),
                             lldbtype.GetTypedefedType(),
                         )
-
+                # else:
+                #     raise Exception(
+                #         lldbtype,
+                #         dep,
+                #         dep_type,
+                #         get_sized_inner(lldbtype.GetTypedefedType()),
+                #         lldbtype.GetTypedefedType(),
+                #     )
         # if not tdtype.IsTypedefType():
         #     # print("leaf typedef:", lldbtype)
         #     # TODO pointer in typedefed type
@@ -739,20 +792,44 @@ class HardDepHeader:
                 DepType.StructBPtrOfTypedefA,
                 DepType.Typedef_A_B,
                 DepType.Typedef_Aptr_B,
+                DepType.Typedef_array_B,
                 DepType.Typedef_enumA_B_or_Typedef_enumAptr_B,
                 # DepType.Typedef_structA_B,
             ):
-
-                assert dep in self.nodes, (self.nodes, dep, dep_type, lldbtype)
+                if dep_type == DepType.Typedef_array_B:
+                    print("ARRAY!!", lldbtype, dep)
+                assert (dep.name, dep.type) in self.nodes_names, (
+                    self.nodes,
+                    dep,
+                    dep_type,
+                    lldbtype,
+                )
                 if last_index == None:
-                    last_index = self.nodes.index(dep)
+                    last_index = self.find_node(dep)
+                    assert last_index != -1
                 else:
-                    last_index = max(self.nodes.index(dep), last_index)
+                    possibly = self.find_node(dep)
+                    assert possibly != -1
+                    last_index = max(possibly, last_index)
             else:
                 self.add_soft_dep(dep)
 
         insert_index = last_index + 1 if last_index is not None else 0
-        self.nodes.insert(insert_index, lldbtype)
+
+        if not (
+            lldbtype.type == lldb.eTypeClassTypedef
+            and (lldbtype.name, lldbtype.type) in self.nodes_names
+        ):
+            # try:
+            #     self.nodes.index(lldbtype)
+            #     raise Exception()
+            # except:
+            #     pass
+            self.nodes_names.add((lldbtype.name, lldbtype.type))
+            self.nodes.insert(insert_index, lldbtype)
+        # if lldbtype not in self.nodes:
+        #     self.nodes.insert(insert_index, lldbtype)
+
         print("end insert_after_deps:", lldbtype.name, insert_index)
         # for dep in incomplete_dependencies(lldbtype):
         #     if dep != lldbtype:
@@ -799,6 +876,10 @@ class HardDepHeader:
             # print("assss")
             defs += get_type_definition(t) + ";\n"
 
+        assert len(self.nodes_names) == len(self.nodes), (
+            len(self.nodes_names),
+            len(self.nodes),
+        )
         print("====")
         print(defs)
         print("====")
