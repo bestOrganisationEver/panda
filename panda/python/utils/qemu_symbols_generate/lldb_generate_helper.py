@@ -3,7 +3,7 @@ import os
 from queue import Empty, Queue
 import sys
 from time import sleep
-from typing import Union
+from typing import Generator, Union
 import lldb
 from lldb.plugins.parsed_cmd import ParsedCommand, LLDBOptionValueParser
 
@@ -29,82 +29,296 @@ def iter_queue(q):  # uses ducktyping
             break
 
 
+class DepType(enum.IntEnum):
+    # this dependency requires a complete definition of the dependency type
+    # which is a product type, like a union or struct (or enum)
+    # struct B {
+    #   struct A a;
+    # };
+    StructBStructA = 0
+
+    # this dependency requires only an (implicit) declaration of the dependency type
+    # which is a product type, like a union or struct (or enum):
+    # struct B {
+    #   struct A* a;
+    # };
+    StructBStructAptr = 1
+
+    # this dependency requires a typedef of the definition type
+    # AND a definition of the type the typedef depends on, if the typedef
+    # requires a definition of the type it depends on
+    # typedef struct A A;
+    # struct B {
+    #   A a;
+    # };
+    StructBtypedefA = 2
+
+    # this dependency requires a typedef of the definition type
+    # but DOES NOT require a definition of the type the typedef depends on
+    # typedef struct A A;
+    # struct B {
+    #   A *a;
+    # };
+    #
+    # or
+    #
+    # typedef struct A *Astar;
+    # struct B {
+    #   Astar a;
+    # };
+    StructBPtrOfTypedefA = 3
+
+    Typedef_A_B = 4
+    Typedef_Aptr_B = 5
+    Typedef_structA_B = 6
+    Typedef_structAptr_B = 7
+    Typedef_enumA_B_or_Typedef_enumAptr_B = 8
+    # # typedef A B;
+    # TypedefDepInTypedef = 4
+
+    # # typedef struct A B;
+    # ProductDepInTypedef = 5
+
+
+def get_sized_inner(lldbtype: lldb.SBType):
+    """dereferences until it hits a type whose size cannot be known without
+    extra information"""
+
+    in_pointer = False
+    while True:
+        ttype = lldbtype.type
+        if ttype == lldb.eTypeClassArray:
+            lldbtype = lldbtype.GetArrayElementType()
+        elif ttype == lldb.eTypeClassPointer:
+            lldbtype = lldbtype.GetPointeeType()
+            in_pointer = True
+        else:
+            return lldbtype, in_pointer
+
+
 def break_type_down(lldbtype: lldb.SBType):
-    """breaks down a type into the types it depends on"""
-    to_resolve: UnresolvedTypeQueue = UnresolvedTypeQueue()
+    """breaks down a type into the types it depends on. yields (dep_type, is_complete_dep)
+    where is_complete_dep is a bool that indicates that the dependency needs a
+    definition when True, and only an (implicit) declaration when False.
+    Typedefs are counted as a definition."""
+
+    assert type(lldbtype) == lldb.SBType
+
+    to_resolve: TypeDepQueue = TypeDepQueue()
     ttype = lldbtype.type
 
     if ttype == lldb.eTypeClassTypedef:
-        to_resolve.put(lldbtype.GetTypedefedType())
+        td_type: lldb.SBType
+        in_pointer: bool
+        td_type, in_pointer = get_sized_inner(lldbtype.GetTypedefedType())
+
+        # to_resolve.put(
+        #     td_type,
+        #     (
+        #         TypeDepState.NotInPointer
+        #         if td_type.IsTypedefType()
+        #         else TypeDepState.InPointer
+        #     ),
+        # )
+
+        # if is_anonymous_type(td_type) or td_type.IsFunctionType():
+        if is_anonymous_type(td_type):
+            # TODO: unroll this. The dep types will be wrong as-is.
+            # somehow it still works.
+            for i in break_type_down(td_type):
+                yield i
+            return
+        elif td_type.IsFunctionType():
+            # TODO: unroll this. The dep types will be wrong as-is.
+            # somehow it still works.
+            for dep, dep_type in break_type_down(td_type):
+                if dep_type == DepType.StructBStructA:
+                    if in_pointer:
+                        yield dep, DepType.Typedef_structAptr_B
+                    else:
+                        yield dep, DepType.Typedef_structA_B
+                elif dep_type == DepType.StructBStructAptr:
+                    yield dep, DepType.Typedef_structAptr_B
+                elif dep_type == DepType.StructBtypedefA:
+                    if in_pointer:
+                        yield dep, DepType.Typedef_Aptr_B
+                    else:
+                        yield dep, DepType.Typedef_A_B
+                elif dep_type == DepType.StructBPtrOfTypedefA:
+                    yield dep, DepType.Typedef_Aptr_B
+                    # raise Exception()
+                else:
+                    raise Exception()
+
+            return
+        else:
+            if td_type.type == lldb.eTypeClassBuiltin:
+                return
+
+            if td_type.type == lldb.eTypeClassEnumeration:
+                dt = DepType.Typedef_enumA_B_or_Typedef_enumAptr_B
+            elif in_pointer and td_type.IsTypedefType():
+                dt = DepType.Typedef_Aptr_B
+            elif not in_pointer and td_type.IsTypedefType():
+                dt = DepType.Typedef_A_B
+            elif in_pointer and not td_type.IsTypedefType():
+                dt = DepType.Typedef_structAptr_B
+            elif not in_pointer and not td_type.IsTypedefType():
+                dt = DepType.Typedef_structA_B
+            else:
+                raise Exception()
+
+            yield td_type, dt
+            return
+
+    # we've handled the immediate typedef.
     elif ttype == lldb.eTypeClassStruct:
         for t in lldbtype.get_fields_array():
-            to_resolve.put(t.GetType())
+            to_resolve.put(t.GetType(), TypeDepState.NotInPointer)
     elif ttype == lldb.eTypeClassUnion:
         for t in lldbtype.get_fields_array():
-            to_resolve.put(t.GetType())
+            to_resolve.put(t.GetType(), TypeDepState.NotInPointer)
     else:
-        to_resolve.put(lldbtype)
+        to_resolve.put(lldbtype, TypeDepState.NotInPointer)
 
-    for lldbtype in iter_queue(to_resolve):
+    for lldbtype, dep_state in iter_queue(to_resolve):
         ttype = lldbtype.type
         if ttype == lldb.eTypeClassArray:
-            to_resolve.put(lldbtype.GetArrayElementType())
+            to_resolve.put(lldbtype.GetArrayElementType(), dep_state)
         elif ttype == lldb.eTypeClassPointer:
-            to_resolve.put(lldbtype.GetPointeeType())
+            to_resolve.put(lldbtype.GetPointeeType(), TypeDepState.InPointer)
         elif ttype == lldb.eTypeClassFunction:
             for t in lldbtype.GetFunctionArgumentTypes():
-                to_resolve.put(t)
-            to_resolve.put(lldbtype.GetFunctionReturnType())
-        elif ttype == lldb.eTypeClassStruct:
-            yield lldbtype
-        elif ttype == lldb.eTypeClassUnion:
-            yield lldbtype
+                to_resolve.put(t, dep_state)
+            to_resolve.put(lldbtype.GetFunctionReturnType(), dep_state)
+        elif ttype in (
+            lldb.eTypeClassStruct,
+            lldb.eTypeClassUnion,
+            lldb.eTypeClassEnumeration,
+        ):
+            if is_anonymous_type(lldbtype):
+                for t in lldbtype.get_fields_array():
+                    to_resolve.put(t.GetType(), dep_state)
+                continue
+
+            if dep_state == TypeDepState.NotInPointer:
+                yield lldbtype, DepType.StructBStructA
+            elif dep_state == TypeDepState.InPointer:
+                yield lldbtype, DepType.StructBStructAptr
+            else:
+                raise Exception()
         elif ttype == lldb.eTypeClassBuiltin:
             # don't even expose to the caller, we can skip this safely
             pass
+        elif ttype == lldb.eTypeClassTypedef:
+            if dep_state == TypeDepState.NotInPointer:
+                yield lldbtype, DepType.StructBtypedefA
+                chain_len, tdtype = resolve_typedefs(lldbtype)
+                assert chain_len != 0
+
+                if tdtype.type != lldb.eTypeClassPointer:
+                    assert not tdtype.IsPointerType()
+
+                    to_resolve.put(tdtype, dep_state)
+            elif dep_state == TypeDepState.InPointer:
+                yield lldbtype, DepType.StructBPtrOfTypedefA
+            else:
+                raise Exception()
         else:
-            yield lldbtype
+            raise Exception()
+            yield lldbtype, dep_state
 
 
-def type_c_repr(lldbtype: lldb.SBType) -> str:
+# def type_c_decl(lldbtype: lldb.SBType) -> str:
+#     ttype = lldbtype.type
+
+#     if ttype == lldb.eTypeClassFunction:
+#         raise NotImplementedError(
+#             "Function type not implemented when not used to declare value", lldbtype
+#         )
+
+#     if ttype == lldb.eTypeClassArray:
+#         raise RuntimeError("Array type not possible when not used to declare value")
+
+#     if ttype == lldb.eTypeClassTypedef:
+#         return "typedef " + type_value_c_repr(
+#             lldbtype.GetTypedefedType(), lldbtype.name, indentation
+#         )
+
+#     if ttype == lldb.eTypeClassStruct:
+#         if is_anonymous_type(lldbtype):
+#             raise RuntimeError("Anonymous type cannot be declared.")
+#         else:
+#             return "struct " + lldbtype.name
+
+#     if ttype == lldb.eTypeClassUnion:
+#         if is_anonymous_type(lldbtype):
+#             raise RuntimeError("Anonymous type cannot be declared.")
+#         else:
+#             return "union " + lldbtype.name
+
+#     if ttype == lldb.eTypeClassEnumeration:
+#         if is_anonymous_type(lldbtype):
+#             raise RuntimeError("Anonymous type cannot be declared.")
+#         else:
+#             return "enum " + lldbtype.name
+
+#     raise RuntimeError("wrong type", lldbtype)
+
+
+def type_c_name_iw(lldbtype: lldb.SBType, iw: "IndentedWriter") -> None:
+    assert type(iw) == IndentedWriter
+
     ttype = lldbtype.type
-    print(7, lldbtype)
     if ttype == lldb.eTypeClassPointer:
-        return "" + type_c_repr(lldbtype.GetPointeeType()) + "*"
+        type_c_name_iw(lldbtype.GetPointeeType(), iw)
+        iw.append_last_line("*")
 
-    if ttype == lldb.eTypeClassFunction:
+    elif ttype == lldb.eTypeClassFunction:
         raise NotImplementedError(
-            "Function type not implemented when not used to declare value"
+            "Function type not implemented when not used to declare value", lldbtype
         )
 
-    if ttype == lldb.eTypeClassArray:
+    elif ttype == lldb.eTypeClassArray:
         raise RuntimeError("Array type not possible when not used to declare value")
 
-    if ttype == lldb.eTypeClassTypedef:
-        return lldbtype.name
+    elif ttype == lldb.eTypeClassTypedef:
+        iw.add_line(lldbtype.name)
 
-    if ttype == lldb.eTypeClassStruct:
-        if is_anonymous_type(lldbtype):
-            return get_type_definition(lldbtype)
-        else:
-            return "struct " + lldbtype.name
+    elif ttype == lldb.eTypeClassStruct:
+        assert not is_anonymous_type(lldbtype), lldbtype
+        # if is_anonymous_type(lldbtype):
+        #     return get_type_definition(lldbtype, indentation)
+        # else:
+        #     return " " * indentation + "struct " + lldbtype.name
+        iw.add_line("struct " + lldbtype.name)
 
-    if ttype == lldb.eTypeClassUnion:
-        if is_anonymous_type(lldbtype):
-            return get_type_definition(lldbtype)
-        else:
-            return "union " + lldbtype.name
+    elif ttype == lldb.eTypeClassUnion:
+        assert not is_anonymous_type(lldbtype)
+        # if is_anonymous_type(lldbtype):
+        #     return get_type_definition(lldbtype, indentation)
+        # else:
+        #     return " " * indentation + "union " + lldbtype.name
+        iw.add_line("union " + lldbtype.name)
 
-    if ttype == lldb.eTypeClassEnumeration:
-        if is_anonymous_type(lldbtype):
-            return get_type_definition(lldbtype)
-        else:
-            return "enum " + lldbtype.name
+    elif ttype == lldb.eTypeClassEnumeration:
+        assert not is_anonymous_type(lldbtype)
+        # if is_anonymous_type(lldbtype):
+        #     return get_type_definition(lldbtype, indentation)
+        # else:
+        #     return " " * indentation + "enum " + lldbtype.name
+        iw.add_line("enum " + lldbtype.name)
 
-    if ttype == lldb.eTypeClassBuiltin:
-        return lldbtype.name
+    elif ttype == lldb.eTypeClassBuiltin:
+        iw.add_line(lldbtype.name)
+    else:
+        raise RuntimeError("wrong type", lldbtype, lldbtype.name, lldbtype.type)
 
-    raise RuntimeError("wrong type", lldbtype)
+
+def type_c_name(lldbtype: lldb.SBType) -> str:
+    iw = IndentedWriter(0)
+    type_c_name_iw(lldbtype, iw)
+    return iw.read()
 
 
 # HACK: due to a bug (?), if you move a (by lldb standards) non-anonymous field of a struct
@@ -120,7 +334,7 @@ def type_c_repr(lldbtype: lldb.SBType) -> str:
 # API is by looking at lldbtype.name and seeing if it ends with ::(unnamed struct)
 # this is heavily leaning into terrible hack territory.
 def is_anonymous_type(lldbtype: lldb.SBType) -> bool:
-    assert type(lldbtype) == lldb.SBType
+    assert type(lldbtype) == lldb.SBType, lldbtype
     unnamed_end = None
     if lldbtype.type == lldb.eTypeClassStruct:
         unnamed_end = ("::(unnamed struct)", "::(anonymous struct)")
@@ -135,49 +349,133 @@ def is_anonymous_type(lldbtype: lldb.SBType) -> bool:
         return lldbtype.IsAnonymousType() or lldbtype.name.endswith(unnamed_end)
 
     else:
-        raise NotImplementedError(
-            "classes and stuff can probably be here too, just not implemented", lldbtype
-        )
+        # raise NotImplementedError(
+        #     "classes and stuff can probably be here too, just not implemented", lldbtype
+        # )
         return lldbtype.IsAnonymousType()
 
 
-def type_value_c_repr(lldbtype: lldb.SBType, var_str: str):
+def type_value_c_repr_iw(
+    lldbtype: lldb.SBType, var_str: str, iw: Union["IndentedWriter", None]
+):
+    if iw is None:
+        iw = IndentedWriter(0)
+    assert type(iw) == IndentedWriter
+
+    assert type(lldbtype) == lldb.SBType, lldbtype
+    assert type(var_str) == str, (var_str, lldbtype)
     ttype = lldbtype.type
     if ttype == lldb.eTypeClassTypedef:
-        return lldbtype.name + " " + var_str
+        iw.add_line(lldbtype.name + " " + var_str)
+        return
 
-    if ttype == lldb.eTypeClassPointer:
+    elif ttype == lldb.eTypeClassPointer:
         # TODO: does this work?
         # return type_value_c_repr(lldbtype.GetPointeeType(), "(*" + var_str + ")")
-        return type_value_c_repr(lldbtype.GetPointeeType(), "*" + var_str + "")
+        return type_value_c_repr_iw(lldbtype.GetPointeeType(), "*" + var_str + "", iw)
 
-    if ttype == lldb.eTypeClassFunction:
+    elif ttype == lldb.eTypeClassFunction:
         args: lldb.SBTypeList = lldbtype.GetFunctionArgumentTypes()
-        args_str = "(" + ", ".join(type_c_repr(arg) for arg in args) + ")"
-        ret_type = type_c_repr(lldbtype.GetFunctionReturnType())
+        args_str = "(" + ", ".join(type_c_name(arg) for arg in args) + ")"
+        ret_type = type_c_name(lldbtype.GetFunctionReturnType())
+        # print("FUNC YO", ret_type + " (" + var_str + ")" + args_str)
+        iw.add_line(ret_type + " (" + var_str + ")" + args_str)
+        return
 
-        return ret_type + " (" + var_str + ")" + args_str
+    elif ttype == lldb.eTypeClassArray:
+        inner: lldb.SBType = lldbtype.GetArrayElementType()
+        if lldbtype.size and lldbtype.size != 0:
+            outer_size = lldbtype.size
+            inner_size = inner.GetByteSize()
+            assert inner_size != 0
+            assert outer_size % inner_size == 0
 
-    if ttype == lldb.eTypeClassArray:
-        return type_value_c_repr(
-            lldbtype.GetArrayElementType(),
-            "(" + var_str + ")[%s]" % str(lldbtype.size) if lldbtype.size else "",
-        )
+            size_str = str(lldbtype.size // inner_size)
+        else:
+            size_str = ""
 
-    if ttype in (
+        type_value_c_repr_iw(inner, "(" + var_str + ")[%s]" % size_str, iw)
+        return
+
+    elif ttype in (
         lldb.eTypeClassStruct,
         lldb.eTypeClassUnion,
         lldb.eTypeClassEnumeration,
     ):
         if is_anonymous_type(lldbtype):
-            return get_type_definition(lldbtype) + " " + var_str
+            get_type_definition_iw(lldbtype, iw)
+            if var_str != "":
+                iw.append_last_line(" " + var_str)
+            return
         else:
-            return type_c_repr(lldbtype) + " " + var_str
+            type_c_name_iw(lldbtype, iw)
+            if var_str != "":
+                iw.append_last_line(" " + var_str)
+            return
 
-    if ttype == lldb.eTypeClassBuiltin:
-        return lldbtype.name + " " + var_str
+    elif ttype == lldb.eTypeClassBuiltin:
+        iw.add_line(lldbtype.name + " " + var_str)
+    else:
+        raise RuntimeError(ttype, lldbtype)
 
-    raise RuntimeError(ttype, lldbtype)
+
+def type_value_c_repr(lldbtype: lldb.SBType, var_str: str) -> str:
+    iw = IndentedWriter(0)
+    type_value_c_repr_iw(lldbtype, var_str, iw)
+    return iw.read()
+
+
+class TypeDepState(enum.IntEnum):
+    InPointer = 0
+    NotInPointer = 1
+
+
+class IndentedWriter:
+    def __init__(self, indent_level: int):
+        self.lvl = indent_level
+        self.lines: list[str] = []
+
+    def set_indent(self, new_indent: int):
+        self.lvl = new_indent
+
+    def inc_indent(self, inc: int):
+        self.lvl += inc
+
+    def dec_indent(self, dec: int):
+        self.lvl -= dec
+
+    def add_line(self, line: str):
+        assert type(line) == str
+        self.lines.append(" " * self.lvl + line)
+
+    def append_last_line(self, suf: str):
+        assert len(self.lines) > 0
+        self.lines[-1] += suf
+
+    def read(self):
+        return "\n".join(self.lines)
+
+    def iterlines(self):
+        for l in self.lines:
+            yield l
+
+
+class TypeDepQueue:
+    def __init__(self):
+        self.q: Queue[tuple[lldb.SBType, TypeDepState]] = Queue()
+        # self.seen: set[str] = set()
+        self.seen: set[tuple[str, int, TypeDepState]] = set()
+
+    def put(self, lldbtype: lldb.SBType, type_dep_state: TypeDepState):
+        assert type(lldbtype) == lldb.SBType, lldbtype
+        # TODO: typename = type_c_repr(lldbtype)
+        typename = (lldbtype.name, lldbtype.type, type_dep_state)
+        if is_anonymous_type(lldbtype) or typename not in self.seen:
+            self.seen.add(typename)
+            self.q.put((lldbtype, type_dep_state))
+
+    def get(self, block=True, timeout=None):
+        return self.q.get(block=block, timeout=timeout)
 
 
 class UnresolvedTypeQueue:
@@ -190,7 +488,7 @@ class UnresolvedTypeQueue:
         assert type(lldbtype) == lldb.SBType, lldbtype
         # TODO: typename = type_c_repr(lldbtype)
         typename = (lldbtype.name, lldbtype.type)
-        if typename not in self.seen:
+        if is_anonymous_type(lldbtype) or typename not in self.seen:
             self.seen.add(typename)
             self.q.put(lldbtype)
 
@@ -198,68 +496,71 @@ class UnresolvedTypeQueue:
         return self.q.get(block=block, timeout=timeout)
 
 
-def get_type_definition(lldbtype: lldb.SBType):
+def get_type_definition_iw(lldbtype: lldb.SBType, iw: IndentedWriter):
+    assert type(iw) == IndentedWriter
+
     ttype = lldbtype.type
 
     if ttype == lldb.eTypeClassStruct:
         typename = lldbtype.name if not is_anonymous_type(lldbtype) else ""
-        return (
-            "struct "
-            + typename
-            + " {\n  "
-            + "\n  ".join(
-                map(
-                    lambda t: (
-                        type_value_c_repr(t.type, t.name)
-                        if t.name is not None
-                        else type_c_repr(t.type)
-                    )
-                    + ";",
-                    lldbtype.fields,
-                )
-            )
-            + "\n}"
-        )
+        print(lldbtype)
+        if is_anonymous_type(lldbtype):
+            iw.add_line("struct {")
+        else:
+            iw.add_line("struct " + lldbtype.name + " {")
+        iw.inc_indent(4)
+        for t in lldbtype.fields:
+            type_value_c_repr_iw(t.type, t.name if t.name is not None else "", iw)
+            iw.append_last_line(";")
+        iw.dec_indent(4)
+        iw.add_line("}")
+        return
 
-    if ttype == lldb.eTypeClassUnion:
+    elif ttype == lldb.eTypeClassUnion:
         typename = lldbtype.name if not is_anonymous_type(lldbtype) else ""
-        return (
-            "union "
-            + typename
-            + " {\n  "
-            + "\n  ".join(
-                map(
-                    lambda t: (
-                        type_value_c_repr(t.type, t.name)
-                        if t.name is not None
-                        else type_c_repr(t.type)
-                    )
-                    + ";",
-                    lldbtype.fields,
-                )
-            )
-            + "\n}"
-        )
-    if ttype == lldb.eTypeClassEnumeration:
+        if is_anonymous_type(lldbtype):
+            iw.add_line("union {")
+        else:
+            iw.add_line("union " + lldbtype.name + " {")
+        iw.inc_indent(4)
+        for t in lldbtype.fields:
+            type_value_c_repr_iw(t.type, t.name if t.name is not None else "", iw)
+            iw.append_last_line(";")
+        iw.dec_indent(4)
+        iw.add_line("}")
+        return
+    elif ttype == lldb.eTypeClassEnumeration:
         typename = lldbtype.name if not is_anonymous_type(lldbtype) else ""
-        return (
-            "enum "
-            + typename
-            + " {\n  "
-            + "\n  ".join(
-                map(
-                    lambda t: (t.name) + ",",
-                    lldbtype.enum_members,
-                )
-            )
-            + "\n}"
-        )
-    if ttype == lldb.eTypeClassTypedef:
-        return "typedef " + type_value_c_repr(
-            lldbtype.GetTypedefedType(), lldbtype.name
-        )
+        if is_anonymous_type(lldbtype):
+            iw.add_line("enum {")
+        else:
+            iw.add_line("enum " + lldbtype.name + " {")
+        iw.inc_indent(4)
+        for t in lldbtype.enum_members:
+            iw.add_line(t.name + ",")
+        iw.dec_indent(4)
+        iw.add_line("}")
 
-    raise RuntimeError(lldbtype)
+        return
+
+    elif ttype == lldb.eTypeClassTypedef:
+        assert iw.lvl == 0
+        iw.add_line(
+            "typedef " + type_value_c_repr(lldbtype.GetTypedefedType(), lldbtype.name)
+        )
+        return
+    elif ttype == lldb.eTypeClassFunction:
+        assert iw.lvl == 0
+        iw.add_line("typedef " + type_value_c_repr(lldbtype, lldbtype.name))
+        return
+    else:
+        raise RuntimeError(lldbtype, lldbtype.type == lldb.eTypeClassFunction)
+
+
+def get_type_definition(lldbtype: lldb.SBType) -> str:
+    iw = IndentedWriter(0)
+    get_type_definition_iw(lldbtype, iw)
+    return iw.read()
 
 
 def str_to_type(
@@ -301,6 +602,205 @@ def resolve_typedefs(lldbtype: lldb.SBType) -> tuple[int, lldb.SBType]:
     return i, lldbtype
 
 
+class TypeDepNode:
+    def __init__(self, lldbtype: lldb.SBType):
+        self.type: lldb.SBType = lldbtype
+
+
+# class TypeBlockDepNode:
+#     def __init__(self, lldbtype: lldb.SBType):
+#         self.type: lldb.SBType = lldbtype
+#         self.soft_deps: list[lldb.SBType] = []
+
+#     def iter_deps(self):
+#         for dep in self.hard_deps:
+#             yield dep
+#         for dep in self.soft_deps:
+#             yield dep
+
+
+class HardDepHeader:
+    def __init__(self):
+        self.nodes: list[lldb.SBType] = []
+        self.outstanding_soft_deps = []
+        # self.soft_deps_that_need_decl: list[lldb.SBType] = []
+
+    def add_typedef_type(self, lldbtype: lldb.SBType, need_complete: bool):
+        print("add typedef type:", lldbtype, need_complete)
+        assert lldbtype.IsTypedefType()
+        if lldbtype in self.nodes:
+            return None
+
+        for dep, dep_type in break_type_down(lldbtype):
+            print("  add_typedef_type dep:", dep.name)
+            if dep.IsTypedefType():
+                self.add_typedef_type(dep, need_complete=need_complete)
+            else:
+                if need_complete or dep.type == lldb.eTypeClassEnumeration:
+                    if dep_type == DepType.Typedef_structA_B:
+                        self.add_type(dep)
+                    elif dep_type == DepType.Typedef_structAptr_B:
+                        self.add_soft_dep(dep)
+                    elif dep_type == DepType.Typedef_enumA_B_or_Typedef_enumAptr_B:
+                        self.add_type(dep)
+                    else:
+                        raise Exception(
+                            lldbtype,
+                            dep,
+                            dep_type,
+                            get_sized_inner(lldbtype.GetTypedefedType()),
+                            lldbtype.GetTypedefedType(),
+                        )
+
+        # if not tdtype.IsTypedefType():
+        #     # print("leaf typedef:", lldbtype)
+        #     # TODO pointer in typedefed type
+        #     if need_complete:
+        #         # print("need_complete:", lldbtype)
+        #         self.add_type(tdtype)
+        #         self.insert_after_deps_resolved(lldbtype)
+        #         return
+        #         # return
+        #     # else:
+        #     #     # print("not need_complete:", lldbtype)
+        #     #     return None
+
+        # # print("non-leaf typedef:", lldbtype)
+        # self.add_typedef_type(tdtype, need_complete=need_complete)
+        # print("end", lldbtype)
+        self.insert_after_deps_resolved(lldbtype)
+
+    def add_soft_dep(self, deptype: lldb.SBType):
+        print("add_soft_dep:", deptype.name)
+        assert deptype.type != lldb.eTypeClassPointer, deptype
+        # if
+        if deptype in self.nodes:
+            return
+        self.outstanding_soft_deps.append(deptype)
+
+    def add_type(
+        self,
+        lldbtype: lldb.SBType,
+        only_implicit_declaration=False,
+    ):
+        assert lldbtype.type != lldb.eTypeClassPointer
+        if not only_implicit_declaration and lldbtype in self.nodes:
+            print("  already in nodes, skipping:", lldbtype.name)
+            return None
+
+        if lldbtype.type == lldb.eTypeClassBuiltin:
+            return None
+
+        print("add_type:", lldbtype.name)
+        if lldbtype.IsTypedefType():
+            self.add_typedef_type(lldbtype, need_complete=False)
+            return
+
+        for dep, dep_type in break_type_down(lldbtype):
+            print("  add_type dep:", lldbtype.name, dep.name)
+            assert dep.type != lldb.eTypeClassBuiltin, (lldbtype, dep)
+            if lldbtype == dep:
+                continue
+            if dep_type == DepType.StructBStructA:
+                # if only_implicit_declaration:
+                self.add_type(dep, only_implicit_declaration)
+                # else:
+                #     self.add_soft_dep(dep)
+            elif dep_type == DepType.StructBStructAptr:
+                self.add_soft_dep(dep)
+            elif dep_type == DepType.StructBtypedefA:
+                # td: lldb.SBType = dep.GetTypedefedType()
+                # assert td.IsValid()
+                self.add_typedef_type(dep, need_complete=True)
+            elif dep_type == DepType.StructBPtrOfTypedefA:
+                self.add_typedef_type(dep, need_complete=False)
+            else:
+                raise Exception()
+        # self.print_defs()
+        # input()
+        self.insert_after_deps_resolved(lldbtype)
+
+    def insert_after_deps_resolved(self, lldbtype: lldb.SBType):
+        print("insert_after_deps_resolved:", lldbtype.name)
+
+        last_index: Union[int, None] = None
+        for dep, dep_type in break_type_down(lldbtype):
+            if dep == lldbtype:
+                continue
+            # it might be possible to cache the index result from the dependencies
+            # but it's tricky, so here we just loop over the list
+            if dep_type in (
+                DepType.StructBStructA,
+                DepType.StructBtypedefA,
+                DepType.StructBPtrOfTypedefA,
+                DepType.Typedef_A_B,
+                DepType.Typedef_Aptr_B,
+                DepType.Typedef_enumA_B_or_Typedef_enumAptr_B,
+                # DepType.Typedef_structA_B,
+            ):
+
+                assert dep in self.nodes, (self.nodes, dep, dep_type, lldbtype)
+                if last_index == None:
+                    last_index = self.nodes.index(dep)
+                else:
+                    last_index = max(self.nodes.index(dep), last_index)
+            else:
+                self.add_soft_dep(dep)
+
+        insert_index = last_index + 1 if last_index is not None else 0
+        self.nodes.insert(insert_index, lldbtype)
+        print("end insert_after_deps:", lldbtype.name, insert_index)
+        # for dep in incomplete_dependencies(lldbtype):
+        #     if dep != lldbtype:
+        #         self.add_soft_dep(dep)
+        #     # if dep not in self.nodes:
+        #     #     self.add_soft_dep(dep)
+        #     # self.soft_deps_that_need_decl.append(dep)
+
+    def resolve_all_deps(self):
+        print("resolve_all_deps:", self.outstanding_soft_deps)
+        if not self.outstanding_soft_deps:
+            return None
+
+        while self.outstanding_soft_deps:
+            # self.print_defs()
+            # print([type_c_name(x) for x in self.outstanding_soft_deps])
+            # input()
+            t = self.outstanding_soft_deps[0]
+            del self.outstanding_soft_deps[0]
+            self.add_type(t, only_implicit_declaration=False)
+
+    def print_defs(self):
+        defs = "=======\n"
+        for t in self.nodes:
+            # print("assss")
+            defs += get_type_definition(t) + ";\n"
+        print(defs)
+        return defs
+
+    def generate(self):
+        print("generating")
+        self.resolve_all_deps()
+
+        defs = ""
+        # print(self.soft_deps_that_need_decl)
+        for t in self.outstanding_soft_deps:
+            # print(1, t.name)
+            # if t.IsTypedefType():
+            #     defs += get_type_definition(t) + ";\n"
+            # else:
+            defs += type_c_name(t) + ";\n"
+        defs += "/* end decls */\n"
+        for t in self.nodes:
+            # print("assss")
+            defs += get_type_definition(t) + ";\n"
+
+        print("====")
+        print(defs)
+        print("====")
+        print([type_c_name(x) for x in self.outstanding_soft_deps])
+
+
 def resolve_types(
     target: lldb.SBTarget,
     types: list[str],
@@ -310,7 +810,7 @@ def resolve_types(
     if recurse_option == DumpCTypeRecurseOption.ToPrimitives:
         # use str instead of lldb.SBType for __in__. Not sure if __in__ works
         # in the expected way for SBType
-        unres_q = UnresolvedTypeQueue()
+        unres_q = Queue()
         # for forward declarations
         struct_typedefs_str: dict[int, str] = {}
         primitive_typedefs_str: dict[int, str] = {}
@@ -325,56 +825,12 @@ def resolve_types(
             assert lldbtype is not None  # just to satisfy the type checker
             unres_q.put(lldbtype)
 
+        h = HardDepHeader()
         for lldbtype in iter_queue(unres_q):
             # add the types we haven't seen into the queue
-            for t in break_type_down(lldbtype):
-                unres_q.put(t)
-
-            # if it's anon, printing it is already handled in the place it's
-            # defined in
-            if is_anonymous_type(lldbtype):
-                continue
-
-            type_str = get_type_definition(lldbtype)
-
-            i, resolved_lldbtype = resolve_typedefs(lldbtype)
-
-            if i != 0:  # is typedef
-                if i not in struct_typedefs_str:
-                    struct_typedefs_str[i] = ""
-                if i not in primitive_typedefs_str:
-                    primitive_typedefs_str[i] = ""
-
-                if resolved_lldbtype.type in (
-                    lldb.eTypeClassStruct,
-                    lldb.eTypeClassUnion,
-                ):
-                    struct_typedefs_str[i] = type_str + ";\n" + struct_typedefs_str[i]
-                elif all(
-                    t.type == lldb.eTypeClassBuiltin
-                    for t in break_type_down(resolved_lldbtype)
-                ):
-                    primitive_typedefs_str[i] = (
-                        type_str + ";\n" + primitive_typedefs_str[i]
-                    )
-                else:
-                    res_str = type_str + ";\n" + res_str
-            else:
-                res_str = type_str + ";\n" + res_str
-
-        # print(primitive_typedefs_str)
-        typedefs = "\n".join(
-            map(
-                lambda x: x[1],
-                sorted(primitive_typedefs_str.items(), key=lambda x: x[0]),
-            )
-        ) + "\n".join(
-            map(
-                lambda x: x[1],
-                sorted(struct_typedefs_str.items(), key=lambda x: x[0]),
-            )
-        )
-        res_str = typedefs + res_str
+            h.add_type(lldbtype)
+        # res_str = typedefs + res_str
+        h.generate()
         # for type in unres_q.seen:
         #     type
     elif recurse_option == DumpCTypeRecurseOption.ToLeaf:
