@@ -511,6 +511,8 @@ def get_type_definition_iw(lldbtype: lldb.SBType, iw: IndentedWriter):
         iw.inc_indent(4)
         for t in lldbtype.fields:
             type_value_c_repr_iw(t.type, t.name if t.name is not None else "", iw)
+            if t.IsBitfield():
+                iw.append_last_line(" : " + str(t.GetBitfieldSizeInBits()))
             iw.append_last_line(";")
         iw.dec_indent(4)
         iw.add_line("}")
@@ -525,6 +527,8 @@ def get_type_definition_iw(lldbtype: lldb.SBType, iw: IndentedWriter):
         iw.inc_indent(4)
         for t in lldbtype.fields:
             type_value_c_repr_iw(t.type, t.name if t.name is not None else "", iw)
+            if t.IsBitfield():
+                iw.append_last_line(" : " + str(t.GetBitfieldSizeInBits()))
             iw.append_last_line(";")
         iw.dec_indent(4)
         iw.add_line("}")
