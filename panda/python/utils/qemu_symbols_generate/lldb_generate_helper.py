@@ -410,16 +410,45 @@ def type_value_c_repr_iw(
 
     elif ttype == lldb.eTypeClassArray:
         inner: lldb.SBType = lldbtype.GetArrayElementType()
-        if lldbtype.size and lldbtype.size != 0:
+        assert lldbtype.size is not None and lldbtype.size != 0
+
+        # HACK: lldbtype.size != 0 actually doesn't correctly check for
+        # incomplete array types like VLAs. There is currently seemingly
+        # no way in the api to check for incomplete array types.
+        # therefore we resort to the last option available: string parsing.
+        # ouch ouch ouch.
+
+        typestr = lldbtype.__repr__()
+        assert type(typestr) == str
+
+        # our array stuffs will be on the last line
+        # anonymous struct definitions can mess with our parsing here, so ignore
+        # everything other than the last line.
+        typestr = typestr.splitlines()[-1]
+        import re
+
+        m = re.match(r"^.*?\[(\d*?)\].*$", typestr)
+        assert m is not None
+        size_str = m.group(1)
+
+        if size_str != "":
+            # we have a complete array (T[x]) instead of an incomplete one (T[])
+            # sanity checks: make sure the size we get from __repr__ wasn't bogus.
             outer_size = lldbtype.size
             inner_size = inner.GetByteSize()
             assert inner_size != 0
             assert outer_size % inner_size == 0
 
-            size_str = str(lldbtype.size // inner_size)
+            size_str_to_check = str(lldbtype.size // inner_size)
+            assert size_str == size_str_to_check, (
+                size_str,
+                size_str_to_check,
+                lldbtype,
+            )
         else:
-            size_str = ""
-
+            # we have an incomplete array (T[])
+            # we'd like to do some sanity checks here but I'm not sure how to :/
+            pass
         type_value_c_repr_iw(inner, "(" + var_str + ")[%s]" % size_str, iw)
         return
 
