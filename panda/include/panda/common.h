@@ -17,6 +17,7 @@
 #include "cpu.h"
 #include "exec/address-spaces.h"
 #include "panda/types.h"
+#include "exec/memory.h"
 
 /**
  * @brief Branch predition hint macros.
@@ -275,6 +276,40 @@ static inline MemTxResult PandaPhysicalAddressToRamOffset(ram_addr_t* out, hwadd
 
     return MEMTX_OK;
 }
+
+
+
+
+static inline int panda_scatterload_decompress(CPUState *env, target_ulong src,
+                                          target_ulong dst, int size) {
+
+    // rcu_read_lock();
+
+    // uint8_t* dst_buff = (uint8_t*) panda_map_virt_to_host(env, dst, size);
+    // if (!dst_buff) {
+    //     return -1;
+    // }
+    // // removed decompress for testing
+
+    // // int element = 0xdeadbeef;
+    // // panda_virtual_memory_write(env, dst, (uint8_t*)&element, sizeof(element));
+    // dst_buff[0] = 0xab;
+    // dst_buff[1] = 0x12;
+    // dst_buff[2] = 0x34;
+    // dst_buff[4] = 0x56;
+    
+    // rcu_read_unlock();
+    // return 0;
+    cu_read_lock();
+    uint8_t tmp = 0;
+    for(int i = 0; i < 4; ++i){
+        cpu_memory_rw_debug(env, dst, &tmp, 1, 1);
+    }
+    rcu_read_unlock();
+    return 0;
+}
+
+
 
 /**
  * @brief Translate a virtual address to a RAM Offset (needed for the taint system)

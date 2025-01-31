@@ -17,6 +17,10 @@
 // for panda_{set/get}_library_mode
 #include "qemu/osdep.h"
 
+int panda_scatterload_decompress_external(CPUState *env, target_ulong src, target_ulong dst, int size) {
+	return panda_scatterload_decompress(env, src, dst, size);
+}
+
 // call main_aux and run everything up to and including panda_callbacks_after_machine_init
 int panda_init(int argc, char **argv, char **envp) {
     return main_aux(argc, argv, envp, PANDA_INIT);

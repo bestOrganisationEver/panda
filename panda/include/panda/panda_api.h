@@ -10,6 +10,8 @@
 // files in this directory that contain subsections like this one.
 
 // from panda_api.c
+int panda_scatterload_decompress_external(CPUState *env, target_ulong src, target_ulong dst, int size);
+
 int panda_init(int argc, char **argv, char **envp);
 int panda_run(void);
 void panda_stop(int code);
