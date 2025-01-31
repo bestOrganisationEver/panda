@@ -300,7 +300,7 @@ static inline int panda_scatterload_decompress(CPUState *env, target_ulong src,
     
     // rcu_read_unlock();
     // return 0;
-    cu_read_lock();
+    rcu_read_lock();
     uint8_t tmp = 0;
     for(int i = 0; i < 4; ++i){
         cpu_memory_rw_debug(env, dst, &tmp, 1, 1);
